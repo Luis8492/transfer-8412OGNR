@@ -9,7 +9,11 @@
 #   役割: JB 実機の対象アプリを frida-ios-dump / bagbak でメモリダンプ復号し、
 #         cryptid=0 を検証して、母艦が機械的に取り込める manifest.json を出力する。
 #
-# 前提（README で詳述予定 / 手順は docs/TROUBLESHOOTING.md の「IPA 取得→復号ランブック」）:
+#   複数アプリ対応: -b を複数指定するか -f <file> でパッケージ名一覧を渡すと、
+#         1 つずつ順番にダンプする。1 アプリの失敗で全体を止めず（best-effort）、
+#         最後に成否サマリ（_batch-results.tsv / _batch-summary.json）を出す。
+#
+# 前提（README で詳述 / 手順は docs/TROUBLESHOOTING.md の「IPA 取得→復号ランブック」）:
 #   - 実機が脱獄済み（A11 機なら palera1n）で frida-server 稼働中
 #   - 対象アプリがインストール済み（01/02 を踏むか手動で install 済み）
 #   - 母艦側 frida と実機 frida-server の **メジャー版が一致**（ズレると頻出故障）
@@ -21,50 +25,107 @@
 #   - python3                        … cryptid/version/sha256/manifest 生成（標準ライブラリのみ）
 #
 # 使い方:
+#   # 単一
 #   ./03-decrypt.sh -b com.example.app
 #   ./03-decrypt.sh -b com.example.app -o ./out --dumper bagbak
 #   ./03-decrypt.sh -b com.example.app -H 192.168.1.50:27042      # frida リモート
 #   FRIDA_IOS_DUMP=/opt/frida-ios-dump/dump.py ./03-decrypt.sh -b com.example.app
 #
-set -euo pipefail
+#   # 複数（-b を繰り返す / ファイルから読む。両方混在も可）
+#   ./03-decrypt.sh -b com.a.app -b com.b.app
+#   ./03-decrypt.sh -f bundles.txt -o ./out
+#   ./03-decrypt.sh -f bundles.txt -b com.extra.app --keep-going
+#
+#   bundles.txt の書式（1 行 1 パッケージ。# 以降はコメント・空行/CR は無視）:
+#     com.example.one
+#     com.example.two   # メモも書ける
+#     # この行はコメント
+#
+set -uo pipefail
+# 注: per-bundle のソフト失敗継続のため -e は使わない（致命エラーは die で明示停止）。
 
 # ---- 既定値 ----------------------------------------------------------------
-BUNDLE=""
+BUNDLES=()             # 対象パッケージ（-b 繰り返し / -f ファイル で蓄積）
 OUT_DIR="./decrypted-out"
 DUMPER="auto"          # auto | frida-ios-dump | bagbak
 DUMP_PY="${FRIDA_IOS_DUMP:-}"   # frida-ios-dump の dump.py パス（未指定なら探索）
 FRIDA_HOST=""          # 例 192.168.1.50:27042（指定で frida リモート、未指定は USB）
 ENCRYPTED_IPA=""       # 任意: 暗号化版 IPA（cryptid before 記録用。無ければ "1(assumed)"）
+KEEP_GOING=1           # 1=失敗しても次のバンドルへ（既定）。0=最初の失敗で停止
 
 log()  { printf '\033[36m[decrypt]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33m[warn]\033[0m %s\n'    "$*" >&2; }
-die()  { printf '\033[31m[error]\033[0m %s\n'   "$*" >&2; exit 1; }
+err()  { printf '\033[31m[error]\033[0m %s\n'   "$*" >&2; }
+die()  { err "$*"; exit 1; }
 
 usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  # シェバング直後の連続コメント行をそのままヘルプとして出す（行番号非依存）。
+  awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
   exit "${1:-0}"
+}
+
+# ---- bundle ファイル読み込み ------------------------------------------------
+read_bundle_file() {
+  local f="$1" line
+  [[ -f "$f" ]] || die "bundle ファイルが見つからない: $f"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"          # 行コメント除去（bundle id に # は来ない）
+    line="${line//$'\r'/}"      # CR 除去（Windows 母艦で編集したファイル対策）
+    # 前後の空白を削る
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" ]] || continue
+    BUNDLES+=("$line")
+  done < "$f"
 }
 
 # ---- 引数 ------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -b|--bundle)    BUNDLE="$2"; shift 2;;
-    -o|--out)       OUT_DIR="$2"; shift 2;;
-    --dumper)       DUMPER="$2"; shift 2;;
-    --dump-path)    DUMP_PY="$2"; shift 2;;
-    -H|--host)      FRIDA_HOST="$2"; shift 2;;
-    --encrypted)    ENCRYPTED_IPA="$2"; shift 2;;
+    -b|--bundle)    [[ $# -ge 2 ]] || die "$1 に値がない"; BUNDLES+=("$2"); shift 2;;
+    -f|--file)      [[ $# -ge 2 ]] || die "$1 に値がない"; read_bundle_file "$2"; shift 2;;
+    -o|--out)       [[ $# -ge 2 ]] || die "$1 に値がない"; OUT_DIR="$2"; shift 2;;
+    --dumper)       [[ $# -ge 2 ]] || die "$1 に値がない"; DUMPER="$2"; shift 2;;
+    --dump-path)    [[ $# -ge 2 ]] || die "$1 に値がない"; DUMP_PY="$2"; shift 2;;
+    -H|--host)      [[ $# -ge 2 ]] || die "$1 に値がない"; FRIDA_HOST="$2"; shift 2;;
+    --encrypted)    [[ $# -ge 2 ]] || die "$1 に値がない"; ENCRYPTED_IPA="$2"; shift 2;;
+    --keep-going)   KEEP_GOING=1; shift;;
+    --stop-on-error) KEEP_GOING=0; shift;;
     -h|--help)      usage 0;;
     *) die "unknown arg: $1 (--help)";;
   esac
 done
 
-[[ -n "$BUNDLE" ]] || { warn "bundle id (-b) is required"; usage 1; }
+# ---- 対象の正規化（重複除去 + 形式チェック） --------------------------------
+if [[ ${#BUNDLES[@]} -eq 0 ]]; then
+  warn "対象パッケージが無い（-b <bundle> か -f <file> を指定）"
+  usage 1
+fi
+
+declare -A _seen=()
+NORM_BUNDLES=()
+for b in "${BUNDLES[@]}"; do
+  if [[ ! "$b" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    warn "不正なパッケージ名としてスキップ: '$b'（reverse-DNS 形式のみ受理）"
+    continue
+  fi
+  if [[ -n "${_seen[$b]:-}" ]]; then
+    warn "重複をスキップ: $b"
+    continue
+  fi
+  _seen[$b]=1
+  NORM_BUNDLES+=("$b")
+done
+BUNDLES=("${NORM_BUNDLES[@]}")
+[[ ${#BUNDLES[@]} -gt 0 ]] || die "有効なパッケージが 1 件も無い"
+
 command -v python3 >/dev/null 2>&1 || die "python3 が見つからない（cryptid 検証/manifest に必須）"
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" || die "出力先を作成できない: $OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"   # 絶対パス化
 
-# ---- frida 疎通の最小確認 ---------------------------------------------------
+log "対象 ${#BUNDLES[@]} 件: ${BUNDLES[*]}"
+
+# ---- frida 疎通の最小確認（バッチ前に 1 回） --------------------------------
 # device の足場（ipt device 相当）はまだ別。ここでは復号前提の frida 到達だけ見る。
 if command -v frida-ps >/dev/null 2>&1; then
   if [[ -n "$FRIDA_HOST" ]]; then
@@ -77,7 +138,7 @@ else
   warn "frida-ps が PATH に無い。dumper 内部の frida に委ねる（疎通未検証）"
 fi
 
-# ---- dumper 解決 -----------------------------------------------------------
+# ---- dumper 解決（バッチ前に 1 回） -----------------------------------------
 resolve_dumper() {
   if [[ "$DUMPER" == "bagbak" ]]; then
     command -v bagbak >/dev/null 2>&1 || die "bagbak が見つからない"
@@ -101,33 +162,72 @@ resolve_dumper() {
 ACTIVE_DUMPER="$(resolve_dumper)"
 log "dumper = $ACTIVE_DUMPER"
 
-# ---- ダンプ実行 -------------------------------------------------------------
-RAW_IPA="$OUT_DIR/${BUNDLE}.ipa"
-case "$ACTIVE_DUMPER" in
-  frida-ios-dump)
-    DUMP_ARGS=("$BUNDLE" -o "$RAW_IPA")
-    [[ -n "$FRIDA_HOST" ]] && DUMP_ARGS+=(-H "${FRIDA_HOST%%:*}")
-    log "実行: python3 $DUMP_PY ${DUMP_ARGS[*]}"
-    python3 "$DUMP_PY" "${DUMP_ARGS[@]}" || die "frida-ios-dump 失敗（frida 版整合/再起動後の palera1n 当て直しを疑う → TROUBLESHOOTING、または r2 on-device フォールバック）"
-    ;;
-  bagbak)
-    log "実行: bagbak -o $OUT_DIR $BUNDLE"
-    bagbak -o "$OUT_DIR" "$BUNDLE" || die "bagbak 失敗"
-    # bagbak は <name>.ipa を out に置く想定。最新 .ipa を拾う。
-    RAW_IPA="$(ls -t "$OUT_DIR"/*.ipa 2>/dev/null | head -n1 || true)"
-    [[ -n "$RAW_IPA" && -f "$RAW_IPA" ]] || die "bagbak 出力 IPA が見つからない: $OUT_DIR"
-    ;;
-esac
-[[ -f "$RAW_IPA" ]] || die "復号 IPA が生成されなかった: $RAW_IPA"
-log "ダンプ完了: $RAW_IPA"
+# ---- 1 バンドルの処理 -------------------------------------------------------
+# 戻り値: 0=OK / 非0=失敗。失敗理由は BUNDLE_REASON に、成果物は BUNDLE_IPA/BUNDLE_MANIFEST に格納。
+# die は使わず return で返す（呼び出し側がバッチ継続を判断する）。
+process_bundle() {
+  local bundle="$1"
+  local raw_ipa="$OUT_DIR/${bundle}.ipa"
+  BUNDLE_REASON=""
+  BUNDLE_IPA=""
+  BUNDLE_MANIFEST=""
 
-# ---- cryptid 検証 + manifest 生成（python・標準ライブラリのみ） -------------
-# Mach-O(fat/thin)を直接パースし LC_ENCRYPTION_INFO(_64) の cryptid をスライス毎に確認。
-# rabin2 等に依存しない（新品の *nix 箱でも動くように）。
-log "cryptid 検証 + manifest 生成..."
-DECRYPT_IPA="$RAW_IPA" ENCRYPTED_IPA="$ENCRYPTED_IPA" BUNDLE_ID="$BUNDLE" \
-DUMPER_NAME="$ACTIVE_DUMPER" OUT_DIR="$OUT_DIR" \
-python3 - <<'PY'
+  log "── [$bundle] ダンプ開始 ───────────────────────────────"
+
+  # --- ダンプ実行 ---
+  case "$ACTIVE_DUMPER" in
+    frida-ios-dump)
+      local dump_args=("$bundle" -o "$raw_ipa")
+      [[ -n "$FRIDA_HOST" ]] && dump_args+=(-H "${FRIDA_HOST%%:*}")
+      log "実行: python3 $DUMP_PY ${dump_args[*]}"
+      if ! python3 "$DUMP_PY" "${dump_args[@]}"; then
+        BUNDLE_REASON="dump_failed (frida-ios-dump 失敗: frida版整合/再起動後の palera1n 当て直し/対象が起動するか を疑う)"
+        return 10
+      fi
+      ;;
+    bagbak)
+      # 既存 IPA 集合を記録 → bagbak が新規生成した IPA を後で特定
+      local before_marker="$OUT_DIR/.bagbak_marker_$$"
+      : > "$before_marker"
+      log "実行: bagbak -o $OUT_DIR $bundle"
+      if ! bagbak -o "$OUT_DIR" "$bundle"; then
+        rm -f "$before_marker"
+        BUNDLE_REASON="dump_failed (bagbak 失敗)"
+        return 10
+      fi
+      # marker より新しい .ipa を採用（既存ダンプの取り違え防止）
+      raw_ipa="$(find "$OUT_DIR" -maxdepth 1 -name '*.ipa' -newer "$before_marker" -print 2>/dev/null \
+                 | xargs -r ls -t 2>/dev/null | head -n1 || true)"
+      rm -f "$before_marker"
+      if [[ -z "$raw_ipa" ]]; then
+        # フォールバック: 最新 .ipa
+        raw_ipa="$(ls -t "$OUT_DIR"/*.ipa 2>/dev/null | head -n1 || true)"
+      fi
+      if [[ -z "$raw_ipa" || ! -f "$raw_ipa" ]]; then
+        BUNDLE_REASON="no_ipa (bagbak 出力 IPA が見つからない)"
+        return 11
+      fi
+      ;;
+    *)
+      BUNDLE_REASON="internal_error (未知の dumper: $ACTIVE_DUMPER)"
+      return 12
+      ;;
+  esac
+
+  if [[ ! -f "$raw_ipa" ]]; then
+    BUNDLE_REASON="no_ipa (復号 IPA が生成されなかった: $raw_ipa)"
+    return 11
+  fi
+  BUNDLE_IPA="$raw_ipa"
+  log "[$bundle] ダンプ完了: $raw_ipa"
+
+  # --- cryptid 検証 + manifest 生成（python・標準ライブラリのみ） ---
+  # Mach-O(fat/thin)を直接パースし LC_ENCRYPTION_INFO(_64) の cryptid をスライス毎に確認。
+  # rabin2 等に依存しない（新品の *nix 箱でも動くように）。
+  log "[$bundle] cryptid 検証 + manifest 生成..."
+  DECRYPT_IPA="$raw_ipa" ENCRYPTED_IPA="$ENCRYPTED_IPA" BUNDLE_ID="$bundle" \
+  DUMPER_NAME="$ACTIVE_DUMPER" OUT_DIR="$OUT_DIR" \
+  python3 - <<'PY'
 import os, sys, json, zipfile, struct, hashlib, plistlib, datetime, tempfile, shutil
 
 decrypt_ipa = os.environ["DECRYPT_IPA"]
@@ -297,12 +397,95 @@ if still_encrypted:
     sys.exit(2)
 print("\n[OK] 復号済み（cryptid=0）。母艦へ IPA + manifest.json を転送して ipt init に投入。")
 PY
-rc=$?
+  local rc=$?
+  BUNDLE_MANIFEST="$OUT_DIR/$(basename "${raw_ipa%.*}").manifest.json"
+  [[ -f "$BUNDLE_MANIFEST" ]] || BUNDLE_MANIFEST=""
 
-echo
-if [[ $rc -eq 0 ]]; then
-  log "完了。出力: $OUT_DIR"
-else
-  warn "cryptid 検証 NG（rc=$rc）。$OUT_DIR の IPA を確認、または r2 on-device フォールバックへ。"
+  if [[ $rc -eq 0 ]]; then
+    return 0
+  elif [[ $rc -eq 2 ]]; then
+    BUNDLE_REASON="cryptid_incomplete (cryptid!=0 スライス残存; 再ダンプ/対象 slice を確認)"
+    return 2
+  else
+    BUNDLE_REASON="verify_error (cryptid 検証/manifest 生成に失敗 rc=$rc; IPA 破損/Info.plist 欠落を疑う)"
+    return 20
+  fi
+}
+
+# ---- バッチ実行 -------------------------------------------------------------
+RESULTS_TSV="$OUT_DIR/_batch-results.tsv"
+{ printf 'bundle\tstatus\treason\tipa\tmanifest\n'; } > "$RESULTS_TSV"
+
+declare -i n_ok=0 n_fail=0 idx=0
+total=${#BUNDLES[@]}
+OK_LIST=()
+FAIL_LIST=()
+
+for bundle in "${BUNDLES[@]}"; do
+  idx+=1
+  log "##### ($idx/$total) $bundle #####"
+  process_bundle "$bundle"
+  prc=$?
+  if [[ $prc -eq 0 ]]; then
+    n_ok+=1
+    OK_LIST+=("$bundle")
+    printf '%s\tOK\t\t%s\t%s\n' "$bundle" "$BUNDLE_IPA" "$BUNDLE_MANIFEST" >> "$RESULTS_TSV"
+    log "[$bundle] ✅ OK"
+  else
+    n_fail+=1
+    FAIL_LIST+=("$bundle")
+    printf '%s\tFAIL\t%s\t%s\t%s\n' "$bundle" "${BUNDLE_REASON:-unknown}" "${BUNDLE_IPA:-}" "${BUNDLE_MANIFEST:-}" >> "$RESULTS_TSV"
+    err "[$bundle] ❌ FAIL: ${BUNDLE_REASON:-unknown}"
+    if [[ $KEEP_GOING -eq 0 ]]; then
+      warn "--stop-on-error 指定のため中断（残り $((total - idx)) 件は未処理）"
+      break
+    fi
+    warn "次のバンドルへ続行（--stop-on-error で停止可）"
+  fi
+done
+
+# ---- バッチ summary JSON 生成 -----------------------------------------------
+RESULTS_TSV="$RESULTS_TSV" OUT_DIR="$OUT_DIR" TOTAL="$total" \
+N_OK="$n_ok" N_FAIL="$n_fail" PROCESSED="$idx" \
+python3 - <<'PY' || warn "batch summary JSON の生成に失敗（_batch-results.tsv は有効）"
+import os, json, datetime
+tsv = os.environ["RESULTS_TSV"]
+rows = []
+with open(tsv, encoding="utf-8") as f:
+    header = f.readline()
+    for line in f:
+        parts = line.rstrip("\n").split("\t")
+        parts += [""] * (5 - len(parts))
+        bundle, status, reason, ipa, manifest = parts[:5]
+        rows.append({"bundle": bundle, "status": status, "reason": reason or None,
+                     "ipa": ipa or None, "manifest": manifest or None})
+summary = {
+    "schema": "ipt-field-kit/decrypt-batch@1",
+    "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "total": int(os.environ["TOTAL"]),
+    "processed": int(os.environ["PROCESSED"]),
+    "ok": int(os.environ["N_OK"]),
+    "failed": int(os.environ["N_FAIL"]),
+    "results": rows,
+}
+path = os.path.join(os.environ["OUT_DIR"], "_batch-summary.json")
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(summary, f, ensure_ascii=False, indent=2)
+print(f"batch summary: {path}")
+PY
+
+# ---- 最終サマリ -------------------------------------------------------------
+echo                                          >&2
+log "════════ バッチ結果 ════════"
+log "対象 $total 件 / 処理 $idx 件 → OK=$n_ok  FAIL=$n_fail"
+[[ ${#OK_LIST[@]}   -gt 0 ]] && log "  OK  : ${OK_LIST[*]}"
+[[ ${#FAIL_LIST[@]} -gt 0 ]] && warn "  FAIL: ${FAIL_LIST[*]}"
+log "詳細: $RESULTS_TSV"
+log "出力: $OUT_DIR"
+
+if [[ $n_fail -gt 0 ]]; then
+  warn "失敗あり。frida 版整合/palera1n 当て直し/対象 slice を確認（README §4.4 / TROUBLESHOOTING）。"
+  exit 2
 fi
-exit $rc
+log "全件 OK。母艦へ IPA + manifest.json を転送して ipt init に投入。"
+exit 0
